@@ -5,7 +5,7 @@
 
 import { useEffect, useRef, useState, useCallback, type ReactNode } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Trophy, Play, RotateCcw, ChevronUp, ChevronDown, ChevronLeft, ChevronRight, Pause, Settings, X, Ghost } from 'lucide-react';
+import { Trophy, Play, RotateCcw, ChevronUp, ChevronDown, ChevronLeft, ChevronRight, Pause, Settings, X, Ghost, Zap, Shield, Wind } from 'lucide-react';
 
 // --- Constants ---
 const GRID_SIZE = 20;
@@ -21,6 +21,16 @@ const MIN_SPEED = 60;
 
 type Point = { x: number; y: number };
 type GameStatus = 'START' | 'PLAYING' | 'PAUSED' | 'GAMEOVER';
+type PowerUpType = 'MULTIPLIER' | 'INVINCIBILITY' | 'SLOW_MO';
+interface PowerUp {
+  point: Point;
+  type: PowerUpType;
+  expiresAt: number;
+}
+interface ActivePowerUp {
+  type: PowerUpType;
+  endTime: number;
+}
 
 export default function App() {
   // --- State ---
@@ -32,6 +42,8 @@ export default function App() {
   const [highScore, setHighScore] = useState(0);
   const [status, setStatus] = useState<GameStatus>('START');
   const [speed, setSpeed] = useState(BASE_SPEED);
+  const [powerUp, setPowerUp] = useState<PowerUp | null>(null);
+  const [activePowerUps, setActivePowerUps] = useState<ActivePowerUp[]>([]);
   const [showSettings, setShowSettings] = useState(false);
   const [particles, setParticles] = useState<{x: number, y: number, color: string, vx: number, vy: number, life: number}[]>([]);
 
@@ -114,6 +126,8 @@ export default function App() {
     setScore(0);
     setSpeed(BASE_SPEED);
     setFood(getRandomPoint(INITIAL_SNAKE));
+    setPowerUp(null);
+    setActivePowerUps([]);
     setStatus('PLAYING');
     lastUpdateTimeRef.current = performance.now();
   };
@@ -128,14 +142,21 @@ export default function App() {
 
     setDirection(nextDirection);
 
+    const isInvincible = activePowerUps.some(p => p.type === 'INVINCIBILITY');
+
     // Collision: Walls
     if (newHead.x < 0 || newHead.x >= GRID_SIZE || newHead.y < 0 || newHead.y >= GRID_SIZE) {
-      handleGameOver();
-      return;
+      if (isInvincible) {
+        newHead.x = (newHead.x + GRID_SIZE) % GRID_SIZE;
+        newHead.y = (newHead.y + GRID_SIZE) % GRID_SIZE;
+      } else {
+        handleGameOver();
+        return;
+      }
     }
 
     // Collision: Self
-    if (snake.some(segment => segment.x === newHead.x && segment.y === newHead.y)) {
+    if (!isInvincible && snake.some(segment => segment.x === newHead.x && segment.y === newHead.y)) {
       handleGameOver();
       return;
     }
@@ -144,8 +165,10 @@ export default function App() {
 
     // Collision: Food
     if (newHead.x === food.x && newHead.y === food.y) {
+      const isMultiplier = activePowerUps.some(p => p.type === 'MULTIPLIER');
       setScore(prev => {
-        const next = prev + 10;
+        const points = isMultiplier ? 20 : 10;
+        const next = prev + points;
         if (next > highScore) {
           setHighScore(next);
           localStorage.setItem('snake-high-score', next.toString());
@@ -154,20 +177,70 @@ export default function App() {
       });
       setFood(getRandomPoint(newSnake));
       setSpeed(prev => Math.max(MIN_SPEED, prev - SPEED_INCREMENT));
-      createExplosion(food.x, food.y, '#22c55e');
+      createExplosion(food.x, food.y, '#f43f5e');
       vibrate(50);
+
+      // Chance to spawn power-up
+      if (!powerUp && Math.random() > 0.7) {
+        const types: PowerUpType[] = ['MULTIPLIER', 'INVINCIBILITY', 'SLOW_MO'];
+        const type = types[Math.floor(Math.random() * types.length)];
+        const p = getRandomPoint(newSnake);
+        if (p.x !== food.x || p.y !== food.y) {
+          setPowerUp({
+            point: p,
+            type,
+            expiresAt: Date.now() + 8000
+          });
+        }
+      }
     } else {
       newSnake.pop();
     }
 
+    // Collision: PowerUp
+    if (powerUp && newHead.x === powerUp.point.x && newHead.y === powerUp.point.y) {
+      const duration = 8000;
+      const newActive = { type: powerUp.type, endTime: Date.now() + duration };
+      setActivePowerUps(prev => [...prev.filter(p => p.type !== powerUp.type), newActive]);
+      setPowerUp(null);
+      
+      const colors = { MULTIPLIER: '#fbbf24', INVINCIBILITY: '#a855f7', SLOW_MO: '#06b6d4' };
+      createExplosion(newHead.x, newHead.y, colors[powerUp.type]);
+      vibrate([50, 30, 50]);
+    }
+
     setSnake(newSnake);
-  }, [snake, food, nextDirection, highScore, getRandomPoint]);
+  }, [snake, food, nextDirection, highScore, getRandomPoint, powerUp, activePowerUps]);
 
   const handleGameOver = () => {
     setStatus('GAMEOVER');
     vibrate([100, 50, 100]);
     createExplosion(snake[0].x, snake[0].y, '#ef4444');
   };
+
+  // --- Clean up PowerUps and Timers ---
+  useEffect(() => {
+    if (status !== 'PLAYING') return;
+
+    const interval = setInterval(() => {
+      const now = Date.now();
+      
+      // Clean grid powerup if expired
+      setPowerUp(prev => {
+        if (prev && prev.expiresAt < now) return null;
+        return prev;
+      });
+
+      // Clean active powerups if expired
+      setActivePowerUps(prev => {
+        const filtered = prev.filter(p => p.endTime > now);
+        if (filtered.length !== prev.length) return filtered;
+        return prev;
+      });
+    }, 500);
+
+    return () => clearInterval(interval);
+  }, [status]);
 
   // --- Rendering ---
   useEffect(() => {
@@ -179,7 +252,10 @@ export default function App() {
     const render = (time: number) => {
       if (status === 'PLAYING') {
         const delta = time - lastUpdateTimeRef.current;
-        if (delta > speed) {
+        const isSlowMo = activePowerUps.some(p => p.type === 'SLOW_MO');
+        const effectiveSpeed = isSlowMo ? speed * 1.5 : speed;
+        
+        if (delta > effectiveSpeed) {
           moveSnake();
           lastUpdateTimeRef.current = time;
         }
@@ -218,11 +294,54 @@ export default function App() {
       );
       ctx.fill();
 
+      // Draw PowerUp
+      if (powerUp) {
+        const colors = { MULTIPLIER: '#fbbf24', INVINCIBILITY: '#a855f7', SLOW_MO: '#06b6d4' };
+        ctx.shadowBlur = 20;
+        ctx.shadowColor = colors[powerUp.type];
+        ctx.fillStyle = colors[powerUp.type];
+        
+        ctx.beginPath();
+        // Pulsing scale
+        const pulse = Math.sin(time / 200) * 0.1 + 0.9;
+        ctx.arc(
+          powerUp.point.x * cellSize + cellSize / 2,
+          powerUp.point.y * cellSize + cellSize / 2,
+          (cellSize / 2.5) * pulse,
+          0,
+          Math.PI * 2
+        );
+        ctx.fill();
+        
+        // Timer ring
+        const timeLeft = (powerUp.expiresAt - Date.now()) / 8000;
+        if (timeLeft > 0) {
+          ctx.strokeStyle = 'white';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(
+            powerUp.point.x * cellSize + cellSize / 2,
+            powerUp.point.y * cellSize + cellSize / 2,
+            cellSize / 2,
+            -Math.PI / 2,
+            -Math.PI / 2 + (Math.PI * 2 * timeLeft)
+          );
+          ctx.stroke();
+        }
+      }
+
       // Draw Snake (Cyan from theme)
-      ctx.shadowBlur = 10;
+      const isInvincible = activePowerUps.some(p => p.type === 'INVINCIBILITY');
+      const isMultiplier = activePowerUps.some(p => p.type === 'MULTIPLIER');
+      
+      ctx.shadowBlur = isInvincible ? 20 : 10;
       snake.forEach((segment, i) => {
-        ctx.shadowColor = i === 0 ? '#22d3ee' : '#0891b2';
-        ctx.fillStyle = i === 0 ? '#22d3ee' : '#0891b2';
+        let baseColor = i === 0 ? '#22d3ee' : '#0891b2';
+        if (isInvincible) baseColor = i === 0 ? '#a855f7' : '#7e22ce';
+        else if (isMultiplier) baseColor = i === 0 ? '#fbbf24' : '#b45309';
+
+        ctx.shadowColor = baseColor;
+        ctx.fillStyle = baseColor;
         
         const r = cellSize / 4;
         const x = segment.x * cellSize + 2;
@@ -343,12 +462,34 @@ export default function App() {
               <span className="text-xs text-slate-500">Processing Speed</span>
               <span className="text-xs font-mono text-cyan-400">{speed}ms</span>
             </div>
-            <div className="w-full h-1 bg-slate-800 rounded-full overflow-hidden">
+            <div className="w-full h-1 bg-slate-800 rounded-full overflow-hidden mb-4">
               <motion.div 
                 className="h-full bg-cyan-500" 
                 animate={{ width: `${(1 - (speed - MIN_SPEED) / (BASE_SPEED - MIN_SPEED)) * 100}%` }}
               />
             </div>
+
+            {/* Active PowerUps UI */}
+            {activePowerUps.length > 0 && (
+              <div className="space-y-3 pt-2 border-t border-white/5">
+                <h4 className="text-[9px] font-bold text-slate-500 uppercase tracking-widest">Active Buffs</h4>
+                <div className="flex flex-col gap-2">
+                  {activePowerUps.map(p => (
+                    <div key={p.type} className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        {p.type === 'MULTIPLIER' && <Zap className="w-3 h-3 text-yellow-400" />}
+                        {p.type === 'INVINCIBILITY' && <Shield className="w-3 h-3 text-purple-400" />}
+                        {p.type === 'SLOW_MO' && <Wind className="w-3 h-3 text-cyan-400" />}
+                        <span className="text-[10px] font-mono text-slate-300 capitalize">{p.type.replace('_', ' ').toLowerCase()}</span>
+                      </div>
+                      <div className="text-[9px] font-mono text-slate-500">
+                        {Math.max(0, Math.ceil((p.endTime - Date.now()) / 1000))}s
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
 
           <button 
